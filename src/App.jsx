@@ -1894,6 +1894,59 @@ function StudioComments() {
     .sc-feed-btn:hover { box-shadow: 0 2px 8px rgba(76,151,255,0.16); transform: translateY(-1px); }
   `;
 
+  const visibleRooms = rooms.filter((r) => canView(r, userId));
+
+  useEffect(() => {
+    visibleRooms.forEach((r) => {
+      [r.thumbFileId, r.bgFileId].forEach((fid) => {
+        if (!fid || roomThumbCache[fid]) return;
+        (async () => {
+          const fraw = await safeGet(FILE_PREFIX + fid, true);
+          if (!fraw) return;
+          try {
+            const fp = JSON.parse(fraw);
+            setRoomThumbCache((prev) => ({ ...prev, [fid]: fp.dataUrl }));
+          } catch (e) { /* ignore */ }
+        })();
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rooms]);
+
+  useEffect(() => {
+    if (!currentRoom || !currentRoom.bgFileId || roomThumbCache[currentRoom.bgFileId]) return;
+    (async () => {
+      const fraw = await safeGet(FILE_PREFIX + currentRoom.bgFileId, true);
+      if (!fraw) return;
+      try {
+        const fp = JSON.parse(fraw);
+        setRoomThumbCache((prev) => ({ ...prev, [currentRoom.bgFileId]: fp.dataUrl }));
+      } catch (e) { /* ignore */ }
+    })();
+  }, [currentRoom, roomThumbCache]);
+
+  useEffect(() => {
+    if (view !== 'lobby' || visibleRooms.length === 0) return;
+    let cancelled = false;
+    const cutoff = () => Date.now() - PRESENCE_TTL;
+    const poll = async () => {
+      const entries = await Promise.all(visibleRooms.slice(0, 30).map(async (r) => {
+        const raw = await safeGet(PRESENCE_PREFIX + r.id, true);
+        const list = parseList(raw).filter((p) => p.lastSeen >= cutoff());
+        return [r.id, list];
+      }));
+      if (cancelled) return;
+      setLobbyPresenceMap(Object.fromEntries(entries));
+    };
+    poll();
+    const t = setInterval(poll, 10000);
+    return () => { cancelled = true; clearInterval(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, rooms.length]);
+
+  const roomBgFileInputRef = useRef(null);
+  const [roomBgUploading, setRoomBgUploading] = useState(false);
+
   if (!nickReady) {
     return (
       <div className="sc-scope w-full flex items-center justify-center" style={{ ...shellStyle, alignItems: 'center', justifyContent: 'center' }}>
@@ -1948,58 +2001,6 @@ function StudioComments() {
     );
   }
 
-  const visibleRooms = rooms.filter((r) => canView(r, userId));
-
-  useEffect(() => {
-    visibleRooms.forEach((r) => {
-      [r.thumbFileId, r.bgFileId].forEach((fid) => {
-        if (!fid || roomThumbCache[fid]) return;
-        (async () => {
-          const fraw = await safeGet(FILE_PREFIX + fid, true);
-          if (!fraw) return;
-          try {
-            const fp = JSON.parse(fraw);
-            setRoomThumbCache((prev) => ({ ...prev, [fid]: fp.dataUrl }));
-          } catch (e) { /* ignore */ }
-        })();
-      });
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rooms]);
-
-  useEffect(() => {
-    if (!currentRoom || !currentRoom.bgFileId || roomThumbCache[currentRoom.bgFileId]) return;
-    (async () => {
-      const fraw = await safeGet(FILE_PREFIX + currentRoom.bgFileId, true);
-      if (!fraw) return;
-      try {
-        const fp = JSON.parse(fraw);
-        setRoomThumbCache((prev) => ({ ...prev, [currentRoom.bgFileId]: fp.dataUrl }));
-      } catch (e) { /* ignore */ }
-    })();
-  }, [currentRoom, roomThumbCache]);
-
-  useEffect(() => {
-    if (view !== 'lobby' || visibleRooms.length === 0) return;
-    let cancelled = false;
-    const cutoff = () => Date.now() - PRESENCE_TTL;
-    const poll = async () => {
-      const entries = await Promise.all(visibleRooms.slice(0, 30).map(async (r) => {
-        const raw = await safeGet(PRESENCE_PREFIX + r.id, true);
-        const list = parseList(raw).filter((p) => p.lastSeen >= cutoff());
-        return [r.id, list];
-      }));
-      if (cancelled) return;
-      setLobbyPresenceMap(Object.fromEntries(entries));
-    };
-    poll();
-    const t = setInterval(poll, 10000);
-    return () => { cancelled = true; clearInterval(t); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, rooms.length]);
-
-  const roomBgFileInputRef = useRef(null);
-  const [roomBgUploading, setRoomBgUploading] = useState(false);
   const onPickRoomBg = async (e) => {
     const file = e.target.files && e.target.files[0];
     e.target.value = '';
