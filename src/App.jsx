@@ -492,6 +492,13 @@ function StudioComments() {
   const [adminPassError, setAdminPassError] = useState('');
 
   const messagesEndRef = useRef(null);
+  const messagesScrollRef = useRef(null);
+  const handleMessagesScroll = () => {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setAutoScrollEnabled(distanceFromBottom < 80);
+  };
   const roomsPollRef = useRef(null);
   const msgPollRef = useRef(null);
   const presencePollRef = useRef(null);
@@ -623,8 +630,12 @@ function StudioComments() {
     return () => clearInterval(roomsPollRef.current);
   }, [view, nicknameSet, loadRooms]);
 
+  const lastMessagesRawRef = useRef('');
   const loadMessages = useCallback(async (roomId) => {
     const raw = await safeGet(MSG_PREFIX + roomId, true);
+    const rawStr = raw || '';
+    if (rawStr === lastMessagesRawRef.current) return;
+    lastMessagesRawRef.current = rawStr;
     setMessages(parseList(raw));
   }, []);
 
@@ -974,6 +985,7 @@ function StudioComments() {
     }
     setError('');
     setCurrentRoom(room);
+    lastMessagesRawRef.current = '';
     setMessages([]);
     setPresence([]);
     setReads([]);
@@ -1531,6 +1543,7 @@ function StudioComments() {
   const openProject = (project) => {
     setActiveProject(project);
     setProjectComments([]);
+    lastProjectChatRawRef.current = '';
     setProjectChatMessages([]);
     setProjectDetailTab('comments');
     setView('project-detail');
@@ -1549,8 +1562,12 @@ function StudioComments() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, activeProject && activeProject.id]);
 
+  const lastProjectChatRawRef = useRef('');
   const loadProjectChat = useCallback(async (projectId) => {
     const raw = await safeGet(PROJECT_CHAT_PREFIX + projectId, true);
+    const rawStr = raw || '';
+    if (rawStr === lastProjectChatRawRef.current) return;
+    lastProjectChatRawRef.current = rawStr;
     setProjectChatMessages(parseList(raw));
   }, []);
 
@@ -1812,17 +1829,18 @@ function StudioComments() {
     fontFamily: "'Inter', 'Helvetica Neue', Arial, sans-serif",
     background: 'var(--bg)',
     color: 'var(--ink)',
-    height: 'min(680px, 85vh)',
+    height: '100dvh',
     display: 'flex',
     flexDirection: 'column',
-    border: '1px solid var(--line)',
-    borderRadius: 8,
-    boxShadow: '0 1px 4px rgba(0,0,0,0.08)',
+    border: 'none',
+    borderRadius: 0,
+    boxShadow: 'none',
     position: 'relative',
   };
 
   const customCss = `
     ${FONT_IMPORT}
+    html, body, #root { height: 100%; margin: 0; padding: 0; }
     .sc-scope * { box-sizing: border-box; }
     .sc-btn-primary {
       background: var(--accent); color: #fff; border: none;
@@ -1958,7 +1976,7 @@ function StudioComments() {
 
   if (!nicknameSet) {
     return (
-      <div className="sc-scope w-full rounded-2xl overflow-hidden" style={shellStyle}>
+      <div className="sc-scope w-full overflow-hidden" style={shellStyle}>
         <style>{customCss}</style>
         <div className="flex-1 flex flex-col items-center justify-center gap-5 p-6">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -2092,7 +2110,7 @@ function StudioComments() {
   };
 
   return (
-    <div className="sc-scope w-full rounded-2xl overflow-hidden" style={shellStyle}>
+    <div className="sc-scope w-full overflow-hidden" style={shellStyle}>
       <style>{customCss}</style>
 
       {view === 'lobby' && (
@@ -2522,12 +2540,14 @@ function StudioComments() {
           </div>
 
           <div
+            ref={messagesScrollRef}
             className="sc-scroll"
             style={{
               flex: 1, overflowY: 'auto', padding: '10px 14px 14px',
               backgroundImage: currentRoom.bgFileId && roomThumbCache[currentRoom.bgFileId] ? `url(${roomThumbCache[currentRoom.bgFileId]})` : undefined,
               backgroundSize: 'cover', backgroundPosition: 'center',
             }}
+            onScroll={handleMessagesScroll}
             onClick={() => { setAdminPanelOpen(false); setLogsOpen(false); setAnalyticsOpen(false); }}
           >
             {messagesLoading ? (
