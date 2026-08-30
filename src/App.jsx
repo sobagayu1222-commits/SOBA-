@@ -4,11 +4,15 @@ import {
   Ban, Folder, History, Search, Copy, Lock, UserPlus, Eye, Settings, Check,
   Mic, MicOff, PhoneCall, PhoneOff, BarChart3, MessageCircle, Image as ImageIcon,
   Smile, Sticker, Link2, Home, LayoutGrid, Camera, Edit3, Info,
+  ArrowDownCircle, ChevronsLeft, ChevronsRight, KeyRound,
 } from 'lucide-react';
 
 const FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');";
 
 const ROOMS_KEY = 'studio:rooms';
+const SITE_ADMIN_PASSPHRASE = 'SOBA=WES';
+const GLOBAL_PRESENCE_KEY = 'studio:global-presence';
+const GLOBAL_PRESENCE_TTL = 20000;
 const NICK_KEY = 'studio:my-nickname';
 const USERID_KEY = 'studio:my-userid';
 const MSG_PREFIX = 'studio:messages:';
@@ -48,12 +52,27 @@ const SYMBOL_CHOICES = [
   '👍', '👎', '☀️', '☔', '❄️', '🍀', '🎵', '🎮', '📷', '💡', '✅', '❌',
   '➡️', '⬅️', '⬆️', '⬇️', '★', '☆', '♪', '♥', '§', '†', '‡', '〶', '＠', '＃', '％', '＆', '〜', '…', '・',
 ];
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-];
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+// If VITE_METERED_APP_NAME / VITE_METERED_API_KEY are set (free account at
+// https://dashboard.metered.ca), fetch real TURN credentials at call time.
+// Falls back to STUN-only (works only on some networks) if not configured.
+let _iceServersCache = null;
+async function getIceServers() {
+  const appName = import.meta.env.VITE_METERED_APP_NAME;
+  const apiKey = import.meta.env.VITE_METERED_API_KEY;
+  if (!appName || !apiKey) return ICE_SERVERS;
+  if (_iceServersCache) return _iceServersCache;
+  try {
+    const res = await fetch(`https://${appName}.metered.live/api/v1/turn/credentials?apiKey=${apiKey}`);
+    if (!res.ok) return ICE_SERVERS;
+    const servers = await res.json();
+    _iceServersCache = Array.isArray(servers) && servers.length ? servers : ICE_SERVERS;
+    return _iceServersCache;
+  } catch (e) {
+    return ICE_SERVERS;
+  }
+}
 
 function uid() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -256,7 +275,7 @@ function computeAnalytics(messages) {
   };
 }
 
-function Avatar({ userId: uId, nickname, profiles, avatarCache, size = 34, isOwner = false, onClick }) {
+function Avatar({ userId: uId, nickname, profiles, avatarCache, size = 34, isOwner = false, isOnline = false, onClick }) {
   const profile = (profiles && profiles[uId]) || null;
   const color = (profile && profile.color) || avatarColor(nickname);
   const icon = profile && profile.icon;
@@ -279,6 +298,15 @@ function Avatar({ userId: uId, nickname, profiles, avatarCache, size = 34, isOwn
       >
         {imgUrl ? <img src={imgUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : (icon || avatarChar(nickname))}
       </div>
+      {isOnline && (
+        <div
+          title="オンライン"
+          style={{
+            position: 'absolute', top: -2, right: -2, width: Math.max(7, size * 0.24), height: Math.max(7, size * 0.24),
+            borderRadius: '50%', background: '#3BC46B', border: '2px solid var(--panel)',
+          }}
+        />
+      )}
       {isOwner && (
         <div
           title="スタジオ管理者"
@@ -436,6 +464,13 @@ function StudioComments() {
   const [callError, setCallError] = useState('');
   const [remoteStreams, setRemoteStreams] = useState({});
 
+  const [autoScrollEnabled, setAutoScrollEnabled] = useState(true);
+  const [tabBarCompact, setTabBarCompact] = useState(false);
+  const [globalPresence, setGlobalPresence] = useState([]);
+  const [siteAdminUnlocked, setSiteAdminUnlocked] = useState(false);
+  const [adminPassInput, setAdminPassInput] = useState('');
+  const [adminPassError, setAdminPassError] = useState('');
+
   const messagesEndRef = useRef(null);
   const roomsPollRef = useRef(null);
   const msgPollRef = useRef(null);
@@ -462,6 +497,8 @@ function StudioComments() {
   const localStreamRef = useRef(null);
   const processedSignalIdsRef = useRef(new Set());
   useEffect(() => { userIdRef.current = userId; }, [userId]);
+  const siteAdminRef = useRef(false);
+  useEffect(() => { siteAdminRef.current = siteAdminUnlocked; }, [siteAdminUnlocked]);
 
   useEffect(() => {
     (async () => {
@@ -480,8 +517,45 @@ function StudioComments() {
       const sraw = await safeGet(STAMP_PREFIX + myId, true);
       setMyStamps(parseList(sraw));
       setNickReady(true);
+      try {
+        if (window.localStorage.getItem('studio:site-admin') === '1') setSiteAdminUnlocked(true);
+      } catch (e) {}
     })();
   }, []);
+
+  // 全体のオンライン状態（どのスタジオを見ていても自分の在室を知らせる）
+  useEffect(() => {
+    if (!nickReady || !userId) return;
+    let cancelled = false;
+    const beat = async () => {
+      const raw = await safeGet(GLOBAL_PRESENCE_KEY, true);
+      const cutoff = Date.now() - GLOBAL_PRESENCE_TTL;
+      let list = parseList(raw).filter((p) => p.lastSeen >= cutoff && p.userId !== userId);
+      list.push({ userId, nickname, lastSeen: Date.now() });
+      if (cancelled) return;
+      setGlobalPresence(list);
+      await safeSet(GLOBAL_PRESENCE_KEY, JSON.stringify(list), true);
+    };
+    beat();
+    const t = setInterval(beat, 8000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [nickReady, userId, nickname]);
+
+  const isUserOnline = useCallback((uId) => {
+    const cutoff = Date.now() - GLOBAL_PRESENCE_TTL;
+    return globalPresence.some((p) => p.userId === uId && p.lastSeen >= cutoff);
+  }, [globalPresence]);
+
+  const unlockSiteAdmin = () => {
+    if (adminPassInput === SITE_ADMIN_PASSPHRASE) {
+      setSiteAdminUnlocked(true);
+      setAdminPassError('');
+      setAdminPassInput('');
+      try { window.localStorage.setItem('studio:site-admin', '1'); } catch (e) {}
+    } else {
+      setAdminPassError('合言葉が違います');
+    }
+  };
 
   const ensureProfiles = useCallback((ids) => {
     const unique = Array.from(new Set(ids.filter(Boolean)));
@@ -592,7 +666,7 @@ function StudioComments() {
     const r = list.find((x) => x.id === roomId);
     if (!r) return;
     setCurrentRoom(r);
-    if (isBannedId(r, userIdRef.current) || !canView(r, userIdRef.current)) {
+    if (!siteAdminRef.current && (isBannedId(r, userIdRef.current) || !canView(r, userIdRef.current))) {
       setView('lobby');
       setCurrentRoom(null);
       setError(isBannedId(r, userIdRef.current)
@@ -636,8 +710,8 @@ function StudioComments() {
   }, [view, currentRoom && currentRoom.id]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages]);
+    if (autoScrollEnabled) messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages, autoScrollEnabled]);
 
   useEffect(() => {
     messages.forEach((m) => {
@@ -701,7 +775,7 @@ function StudioComments() {
     if (ids.length) ensureProfiles(ids);
   }, [messages, presence, reads, typingUsers, moments, projects, projectComments, dmThreads, dmMessages, ensureProfiles]);
 
-  const isAdmin = !!(currentRoom && userId && currentRoom.ownerId === userId);
+  const isAdmin = !!(siteAdminUnlocked || (currentRoom && userId && currentRoom.ownerId === userId));
 
   const startReply = (m) => {
     const snippetSource = m.text || (m.attachment ? (m.attachment.kind === 'image' ? '［画像］' : m.attachment.kind === 'stamp' ? '［スタンプ］' : `［${m.attachment.name}］`) : '');
@@ -857,7 +931,7 @@ function StudioComments() {
   };
 
   const enterRoom = (room) => {
-    if (isBannedId(room, userId)) {
+    if (!siteAdminUnlocked && isBannedId(room, userId)) {
       setError('このスタジオから追放されているため、入ることができません。');
       return;
     }
@@ -900,7 +974,7 @@ function StudioComments() {
   const sendMessage = async () => {
     const text = draft.trim();
     if ((!text && !pendingAttachment) || !currentRoom || sending) return;
-    if (isBannedId(currentRoom, userId) || !canView(currentRoom, userId)) {
+    if (!siteAdminUnlocked && (isBannedId(currentRoom, userId) || !canView(currentRoom, userId))) {
       setError('この操作は許可されていません。');
       return;
     }
@@ -957,7 +1031,7 @@ function StudioComments() {
 
   const sendStamp = async (stamp) => {
     if (!currentRoom || sending) return;
-    if (isBannedId(currentRoom, userId) || !canView(currentRoom, userId)) return;
+    if (!siteAdminUnlocked && (isBannedId(currentRoom, userId) || !canView(currentRoom, userId))) return;
     setSending(true);
     const raw = await safeGet(MSG_PREFIX + currentRoom.id, true);
     let list = parseList(raw);
@@ -1019,6 +1093,20 @@ function StudioComments() {
       return updated;
     }
     return null;
+  };
+
+  const deleteRoom = async () => {
+    if (!currentRoom || !isAdmin) return;
+    if (!window.confirm(`「${currentRoom.name}」を削除します。よろしいですか？（元に戻せません）`)) return;
+    const raw = await safeGet(ROOMS_KEY, true);
+    const list = parseList(raw).filter((r) => r.id !== currentRoom.id);
+    const ok = await safeSet(ROOMS_KEY, JSON.stringify(list), true);
+    if (ok) {
+      setRooms(list);
+      setCurrentRoom(null);
+      setAdminPanelOpen(false);
+      setView('lobby');
+    }
   };
 
   const banUser = async (targetId) => {
@@ -1255,7 +1343,7 @@ function StudioComments() {
 
   const deleteMoment = async (id) => {
     const m = moments.find((x) => x.id === id);
-    if (!m || m.userId !== userId) return;
+    if (!m || (m.userId !== userId && !siteAdminUnlocked)) return;
     const raw = await safeGet(MOMENTS_KEY, true);
     const list = parseList(raw).filter((x) => x.id !== id);
     const ok = await safeSet(MOMENTS_KEY, JSON.stringify(list), true);
@@ -1317,7 +1405,7 @@ function StudioComments() {
 
   const deleteProject = async (id) => {
     const p = projects.find((x) => x.id === id);
-    if (!p || p.authorId !== userId) return;
+    if (!p || (p.authorId !== userId && !siteAdminUnlocked)) return;
     const raw = await safeGet(PROJECTS_KEY, true);
     const list = parseList(raw).filter((x) => x.id !== id);
     const ok = await safeSet(PROJECTS_KEY, JSON.stringify(list), true);
@@ -1364,17 +1452,29 @@ function StudioComments() {
   };
 
   // ---- voice call (WebRTC, storage-signaled, experimental) ----
+  // Each signal is now its own row (unique key) instead of being appended into one shared
+  // list. Two people can generate several ICE candidates within milliseconds of each other;
+  // a shared read-modify-write list loses entries when that happens over the network.
+  // Independent inserts never collide - this is what actually fixes "joined but no audio".
   const pushCallSignal = async (roomId, signal) => {
-    const raw = await safeGet(CALL_SIGNAL_PREFIX + roomId, true);
-    let list = parseList(raw);
-    list.push({ ...signal, id: uid(), ts: Date.now() });
-    const cutoff = Date.now() - 30000;
-    list = list.filter((s) => s.ts >= cutoff).slice(-120);
-    await safeSet(CALL_SIGNAL_PREFIX + roomId, JSON.stringify(list), true);
+    const key = `${CALL_SIGNAL_PREFIX}${roomId}:${uid()}`;
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/kv_store`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates',
+        },
+        body: JSON.stringify({ key, value: JSON.stringify({ ...signal, id: uid(), ts: Date.now() }) }),
+      });
+    } catch (e) { /* ignore */ }
   };
 
-  const createPeerConnection = useCallback((peerId, roomId) => {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const createPeerConnection = useCallback(async (peerId, roomId) => {
+    const iceServers = await getIceServers();
+    const pc = new RTCPeerConnection({ iceServers });
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => pc.addTrack(track, localStreamRef.current));
     }
@@ -1389,15 +1489,28 @@ function StudioComments() {
   }, []);
 
   const pollCallSignals = useCallback(async (roomId) => {
-    const raw = await safeGet(CALL_SIGNAL_PREFIX + roomId, true);
-    const list = parseList(raw);
-    for (const sig of list) {
+    let rows = [];
+    try {
+      const res = await fetch(
+        `${SUPABASE_URL}/rest/v1/kv_store?key=like.${encodeURIComponent(CALL_SIGNAL_PREFIX + roomId + ':')}*&select=key,value`,
+        { headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` } }
+      );
+      if (res.ok) rows = await res.json();
+    } catch (e) { return; }
+
+    const cutoff = Date.now() - 30000;
+    const doneKeys = [];
+    for (const row of rows) {
+      let sig;
+      try { sig = JSON.parse(row.value); } catch (e) { continue; }
+      if (!sig || sig.ts < cutoff) { doneKeys.push(row.key); continue; }
       if (sig.to !== userIdRef.current || processedSignalIdsRef.current.has(sig.id)) continue;
       processedSignalIdsRef.current.add(sig.id);
+      doneKeys.push(row.key);
       let pc = pcRefs.current[sig.from];
       try {
         if (sig.kind === 'offer') {
-          if (!pc) pc = createPeerConnection(sig.from, roomId);
+          if (!pc) pc = await createPeerConnection(sig.from, roomId);
           await pc.setRemoteDescription(new RTCSessionDescription(sig.payload));
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
@@ -1408,6 +1521,15 @@ function StudioComments() {
           if (pc) await pc.addIceCandidate(new RTCIceCandidate(sig.payload));
         }
       } catch (e) { /* ignore malformed / out-of-order signal */ }
+    }
+
+    for (const key of doneKeys) {
+      try {
+        await fetch(`${SUPABASE_URL}/rest/v1/kv_store?key=eq.${encodeURIComponent(key)}`, {
+          method: 'DELETE',
+          headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+        });
+      } catch (e) { /* ignore */ }
     }
   }, [createPeerConnection]);
 
@@ -1433,7 +1555,7 @@ function StudioComments() {
     setCallConnecting(false);
 
     for (const peer of existingPeers) {
-      const pc = createPeerConnection(peer.userId, roomId);
+      const pc = await createPeerConnection(peer.userId, roomId);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await pushCallSignal(roomId, { from: userId, to: peer.userId, kind: 'offer', payload: offer });
@@ -1827,6 +1949,9 @@ function StudioComments() {
                   管理者: {currentRoom.ownerNickname}
                 </div>
               </div>
+              <button className={`sc-icon-btn ${autoScrollEnabled ? 'active' : ''}`} title={autoScrollEnabled ? '自動スクロール: ON' : '自動スクロール: OFF'} onClick={() => setAutoScrollEnabled((v) => !v)}>
+                <ArrowDownCircle size={16} />
+              </button>
               <button className={`sc-icon-btn ${analyticsOpen ? 'active' : ''}`} title="会話の分析" onClick={() => { setAnalyticsOpen((v) => !v); setAdminPanelOpen(false); setLogsOpen(false); }}>
                 <BarChart3 size={16} />
               </button>
@@ -1846,7 +1971,7 @@ function StudioComments() {
               ) : (
                 presence.slice(0, 8).map((p) => (
                   <div key={p.userId} style={{ display: 'flex', alignItems: 'center', gap: 3, cursor: 'pointer' }} onClick={() => openViewProfile(p.userId, p.nickname)}>
-                    <Avatar userId={p.userId} nickname={p.nickname} profiles={profiles} avatarCache={avatarCache} size={16} isOwner={p.userId === currentRoom.ownerId} />
+                    <Avatar userId={p.userId} nickname={p.nickname} profiles={profiles} avatarCache={avatarCache} size={16} isOwner={p.userId === currentRoom.ownerId} isOnline={isUserOnline(p.userId)} />
                     <span style={{ fontSize: 11, color: '#DCEBFF' }}>{p.nickname}</span>
                   </div>
                 ))
@@ -1909,8 +2034,14 @@ function StudioComments() {
                   </button>
                 </div>
 
-                <button className="sc-action-link" style={{ border: '1px solid var(--owner)', color: 'var(--owner)', borderRadius: 5, marginBottom: 10, width: '100%', justifyContent: 'center', padding: '5px 0' }} onClick={openDmMonitor}>
-                  <MessageCircle size={12} /> DM監視（全ユーザーのDMを確認）
+                {siteAdminUnlocked && (
+                  <button className="sc-action-link" style={{ border: '1px solid var(--owner)', color: 'var(--owner)', borderRadius: 5, marginBottom: 10, width: '100%', justifyContent: 'center', padding: '5px 0' }} onClick={openDmMonitor}>
+                    <MessageCircle size={12} /> DM監視（チャット管理者専用）
+                  </button>
+                )}
+
+                <button className="sc-action-link danger" style={{ border: '1px solid var(--danger)', borderRadius: 5, marginBottom: 10, width: '100%', justifyContent: 'center', padding: '5px 0' }} onClick={deleteRoom}>
+                  <Trash2 size={12} /> このスタジオを削除する
                 </button>
 
                 <div style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--ink-soft)', textTransform: 'uppercase', letterSpacing: 0.3, marginBottom: 6 }}>
@@ -1922,7 +2053,7 @@ function StudioComments() {
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 }}>
                     {onlineNonOwner.map((p) => (
                       <div key={p.userId} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Avatar userId={p.userId} nickname={p.nickname} profiles={profiles} avatarCache={avatarCache} size={20} onClick={() => openViewProfile(p.userId, p.nickname)} />
+                        <Avatar userId={p.userId} nickname={p.nickname} profiles={profiles} avatarCache={avatarCache} size={20} isOnline={isUserOnline(p.userId)} onClick={() => openViewProfile(p.userId, p.nickname)} />
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ fontSize: 12, color: 'var(--ink-strong)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.nickname}</div>
                           <IdTag userId={p.userId} />
@@ -2116,7 +2247,7 @@ function StudioComments() {
                       transition: 'background 0.6s ease',
                     }}
                   >
-                    <Avatar userId={m.userId} nickname={m.nickname} profiles={profiles} avatarCache={avatarCache} size={30} isOwner={ownerMsg} onClick={() => openViewProfile(m.userId, m.nickname)} />
+                    <Avatar userId={m.userId} nickname={m.nickname} profiles={profiles} avatarCache={avatarCache} size={30} isOwner={ownerMsg} isOnline={isUserOnline(m.userId)} onClick={() => openViewProfile(m.userId, m.nickname)} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, flexWrap: 'wrap' }}>
                         <span style={{ color: 'var(--link)', fontWeight: 700, fontSize: 13, cursor: 'pointer' }} onClick={() => openViewProfile(m.userId, m.nickname)}>{m.nickname}</span>
@@ -2374,7 +2505,7 @@ function StudioComments() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {dmThreads.map((t) => (
                   <button key={t.peerId} className="sc-feed-btn" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10 }} onClick={() => openDmWith(t.peerId, t.peerNickname)}>
-                    <Avatar userId={t.peerId} nickname={t.peerNickname} profiles={profiles} avatarCache={avatarCache} size={36} />
+                    <Avatar userId={t.peerId} nickname={t.peerNickname} profiles={profiles} avatarCache={avatarCache} size={36} isOnline={isUserOnline(t.peerId)} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--ink-strong)' }}>{t.peerNickname}</div>
                       <div style={{ fontSize: 11.5, color: 'var(--ink-soft)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.lastMessage}</div>
@@ -2394,8 +2525,11 @@ function StudioComments() {
             <button onClick={() => { clearInterval(dmPollRef.current); setView('dm-list'); }} style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', display: 'flex' }}>
               <ArrowLeft size={20} />
             </button>
-            <Avatar userId={activeDmPeer.userId} nickname={activeDmPeer.nickname} profiles={profiles} avatarCache={avatarCache} size={26} onClick={() => openViewProfile(activeDmPeer.userId, activeDmPeer.nickname)} />
+            <Avatar userId={activeDmPeer.userId} nickname={activeDmPeer.nickname} profiles={profiles} avatarCache={avatarCache} size={26} isOnline={isUserOnline(activeDmPeer.userId)} onClick={() => openViewProfile(activeDmPeer.userId, activeDmPeer.nickname)} />
             <div style={{ fontWeight: 800, fontSize: 15, color: '#fff' }}>{activeDmPeer.nickname}</div>
+          </div>
+          <div style={{ padding: '6px 14px', fontSize: 10, color: 'var(--ink-soft)', background: '#FBF3E2', borderBottom: '1px solid var(--line)', display: 'flex', gap: 6, alignItems: 'center' }}>
+            <Info size={11} /> 運営（チャット管理者）はモデレーション目的でこのDMを確認できる場合があります。
           </div>
           <div className="sc-scroll" style={{ flex: 1, overflowY: 'auto', padding: '14px' }}>
             {dmMessages.length === 0 ? (
@@ -2444,7 +2578,7 @@ function StudioComments() {
             </div>
           </div>
           <div style={{ padding: '8px 14px', fontSize: 10.5, color: 'var(--ink-soft)', background: '#FBF3E2', borderBottom: '1px solid var(--line)', display: 'flex', gap: 6, alignItems: 'center' }}>
-            <Info size={12} /> このスタジオの管理者として、全ユーザーのDMを確認できます。
+            <Info size={12} /> チャット管理者として、全ユーザーのDMを確認できます。
           </div>
           <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
             <div className="sc-scroll" style={{ width: 150, borderRight: '1px solid var(--line)', overflowY: 'auto', flexShrink: 0 }}>
@@ -2545,7 +2679,7 @@ function StudioComments() {
                       <Avatar userId={m.userId} nickname={m.nickname} profiles={profiles} avatarCache={avatarCache} size={26} onClick={() => openViewProfile(m.userId, m.nickname)} />
                       <div style={{ fontWeight: 700, fontSize: 12.5, color: 'var(--ink-strong)' }}>{m.nickname}</div>
                       <div style={{ fontSize: 10.5, color: 'var(--ink-soft)' }}>{fmtRelative(m.ts)}</div>
-                      {m.userId === userId && (
+                      {(m.userId === userId || siteAdminUnlocked) && (
                         <button className="sc-action-link danger" style={{ marginLeft: 'auto' }} onClick={() => deleteMoment(m.id)}>
                           <Trash2 size={11} />
                         </button>
@@ -2658,7 +2792,7 @@ function StudioComments() {
               <ArrowLeft size={20} />
             </button>
             <div style={{ fontWeight: 800, fontSize: 15, color: '#fff', wordBreak: 'break-word' }}>{activeProject.title}</div>
-            {activeProject.authorId === userId && (
+            {(activeProject.authorId === userId || siteAdminUnlocked) && (
               <button className="sc-icon-btn" style={{ marginLeft: 'auto' }} title="削除する" onClick={() => { deleteProject(activeProject.id); setView('projects'); }}>
                 <Trash2 size={14} />
               </button>
@@ -2715,18 +2849,27 @@ function StudioComments() {
       )}
 
       {showTabBar && (
-        <div style={{ display: 'flex', borderTop: '1px solid var(--line)', background: 'var(--panel)', flexShrink: 0 }}>
-          <button className={`sc-tab-btn ${view === 'lobby' ? 'active' : ''}`} onClick={() => switchTab('lobby')}>
-            <Home size={18} /><span style={{ fontSize: 9.5, fontWeight: 700 }}>スタジオ</span>
-          </button>
-          <button className={`sc-tab-btn ${view === 'dm-list' ? 'active' : ''}`} onClick={() => switchTab('dm-list')}>
-            <MessageCircle size={18} /><span style={{ fontSize: 9.5, fontWeight: 700 }}>DM</span>
-          </button>
-          <button className={`sc-tab-btn ${view === 'moments' ? 'active' : ''}`} onClick={() => switchTab('moments')}>
-            <ImageIcon size={18} /><span style={{ fontSize: 9.5, fontWeight: 700 }}>つぶやき</span>
-          </button>
-          <button className={`sc-tab-btn ${view === 'projects' ? 'active' : ''}`} onClick={() => switchTab('projects')}>
-            <LayoutGrid size={18} /><span style={{ fontSize: 9.5, fontWeight: 700 }}>プロジェクト</span>
+        <div style={{ display: 'flex', alignItems: 'center', borderTop: '1px solid var(--line)', background: 'var(--panel)', flexShrink: 0 }}>
+          <div style={{ display: 'flex', flex: 1 }}>
+            <button className={`sc-tab-btn ${view === 'lobby' ? 'active' : ''}`} onClick={() => switchTab('lobby')} style={tabBarCompact ? { padding: '6px 0' } : undefined}>
+              <Home size={tabBarCompact ? 16 : 18} />{!tabBarCompact && <span style={{ fontSize: 9.5, fontWeight: 700 }}>スタジオ</span>}
+            </button>
+            <button className={`sc-tab-btn ${view === 'dm-list' ? 'active' : ''}`} onClick={() => switchTab('dm-list')} style={tabBarCompact ? { padding: '6px 0' } : undefined}>
+              <MessageCircle size={tabBarCompact ? 16 : 18} />{!tabBarCompact && <span style={{ fontSize: 9.5, fontWeight: 700 }}>DM</span>}
+            </button>
+            <button className={`sc-tab-btn ${view === 'moments' ? 'active' : ''}`} onClick={() => switchTab('moments')} style={tabBarCompact ? { padding: '6px 0' } : undefined}>
+              <ImageIcon size={tabBarCompact ? 16 : 18} />{!tabBarCompact && <span style={{ fontSize: 9.5, fontWeight: 700 }}>つぶやき</span>}
+            </button>
+            <button className={`sc-tab-btn ${view === 'projects' ? 'active' : ''}`} onClick={() => switchTab('projects')} style={tabBarCompact ? { padding: '6px 0' } : undefined}>
+              <LayoutGrid size={tabBarCompact ? 16 : 18} />{!tabBarCompact && <span style={{ fontSize: 9.5, fontWeight: 700 }}>プロジェクト</span>}
+            </button>
+          </div>
+          <button
+            title={tabBarCompact ? '元の大きさに戻す' : '小さくする'}
+            onClick={() => setTabBarCompact((v) => !v)}
+            style={{ background: 'none', border: 'none', borderLeft: '1px solid var(--line)', color: 'var(--ink-soft)', cursor: 'pointer', padding: '0 8px', height: tabBarCompact ? 30 : 46, display: 'flex', alignItems: 'center' }}
+          >
+            {tabBarCompact ? <ChevronsRight size={14} /> : <ChevronsLeft size={14} />}
           </button>
         </div>
       )}
@@ -2804,6 +2947,39 @@ function StudioComments() {
               </div>
             </div>
 
+            <div style={{ background: 'var(--panel-alt)', border: '1px solid var(--line)', borderRadius: 8, padding: 10, marginBottom: 14 }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--ink-soft)', textTransform: 'uppercase', letterSpacing: 0.3, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <KeyRound size={11} /> チャット管理者
+              </div>
+              {siteAdminUnlocked ? (
+                <div style={{ fontSize: 11.5, color: 'var(--owner)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <ShieldCheck size={13} /> チャット管理者として有効になっています
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <input
+                      type="password"
+                      className="sc-input flex-1 rounded-lg px-3 py-2 text-sm"
+                      placeholder="合言葉を入力"
+                      value={adminPassInput}
+                      onChange={(e) => { setAdminPassInput(e.target.value); setAdminPassError(''); }}
+                      onKeyDown={(e) => { if (e.key === 'Enter') unlockSiteAdmin(); }}
+                    />
+                    <button className="sc-action-link" style={{ border: '1px solid var(--line)', borderRadius: 5, flexShrink: 0 }} onClick={unlockSiteAdmin}>
+                      解除
+                    </button>
+                  </div>
+                  {adminPassError && (
+                    <div style={{ fontSize: 10.5, color: 'var(--danger-deep)', marginTop: 4 }}>{adminPassError}</div>
+                  )}
+                  <div style={{ fontSize: 10, color: 'var(--ink-soft)', marginTop: 6, lineHeight: 1.6 }}>
+                    正しい合言葉を知っている人だけが使える機能です。通常は入力不要です。
+                  </div>
+                </>
+              )}
+            </div>
+
             <div style={{ marginBottom: 14 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--ink-strong)', marginBottom: 6 }}>アイコンを選ぶ（画像未設定時）</div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: 6 }}>
@@ -2848,7 +3024,7 @@ function StudioComments() {
               </button>
             </div>
             <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 10 }}>
-              <Avatar userId={viewProfileTarget.userId} nickname={viewProfileTarget.nickname} profiles={profiles} avatarCache={avatarCache} size={64} />
+              <Avatar userId={viewProfileTarget.userId} nickname={viewProfileTarget.nickname} profiles={profiles} avatarCache={avatarCache} size={64} isOnline={isUserOnline(viewProfileTarget.userId)} />
             </div>
             <div style={{ fontWeight: 800, fontSize: 16, color: 'var(--ink-strong)' }}>{viewProfileTarget.nickname}</div>
             <div style={{ display: 'flex', justifyContent: 'center', marginTop: 4, marginBottom: 10 }}>
