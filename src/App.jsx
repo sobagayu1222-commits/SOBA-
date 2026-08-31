@@ -2298,6 +2298,13 @@ function StudioComments() {
     })();
   }, [currentRoom, roomThumbCache]);
 
+  const roomBgFileInputRef = useRef(null);
+  const [roomBgUploading, setRoomBgUploading] = useState(false);
+  const roomBgmFileInputRef = useRef(null);
+  const [roomBgmUploading, setRoomBgmUploading] = useState(false);
+  const [bgmEnabled, setBgmEnabled] = useState(false);
+  const bgmAudioRef = useRef(null);
+
   useEffect(() => {
     setBgmEnabled(false);
   }, [currentRoom && currentRoom.id]);
@@ -2330,13 +2337,6 @@ function StudioComments() {
     return () => { cancelled = true; clearInterval(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, rooms.length]);
-
-  const roomBgFileInputRef = useRef(null);
-  const [roomBgUploading, setRoomBgUploading] = useState(false);
-  const roomBgmFileInputRef = useRef(null);
-  const [roomBgmUploading, setRoomBgmUploading] = useState(false);
-  const [bgmEnabled, setBgmEnabled] = useState(false);
-  const bgmAudioRef = useRef(null);
 
   if (!nickReady) {
     return (
