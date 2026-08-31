@@ -11,6 +11,7 @@ const FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Inter
 
 const ROOMS_KEY = 'studio:rooms';
 const NOTIF_PREFIX = 'studio:notif:';
+const NICKNAME_REGISTRY_KEY = 'studio:nickname-registry';
 const ANNOUNCEMENT_KEY = 'studio:announcement';
 const URL_REGEX = /(https?:\/\/[^\s<>"']+)/g;
 const MENTION_REGEX = /@([^\s@]{1,20})/g;
@@ -42,6 +43,7 @@ const TYPING_TTL = 4000;
 const CALL_TTL = 20000;
 const MAX_ORIGINAL_BYTES = 8 * 1024 * 1024;
 const MAX_NONIMAGE_BYTES = 1.5 * 1024 * 1024;
+const MAX_BGM_BYTES = 5 * 1024 * 1024;
 const IMAGE_MAX_DIM = 900;
 const IMAGE_QUALITY = 0.72;
 const COMMENT_MAX_LEN = 500;
@@ -444,6 +446,10 @@ function StudioComments() {
   const [replyTo, setReplyTo] = useState(null);
   const [highlightId, setHighlightId] = useState(null);
   const [pendingAttachment, setPendingAttachment] = useState(null);
+  const [dmPendingAttachment, setDmPendingAttachment] = useState(null);
+  const [dmAttaching, setDmAttaching] = useState(false);
+  const [dmAttachError, setDmAttachError] = useState('');
+  const dmFileInputRef = useRef(null);
   const [attaching, setAttaching] = useState(false);
   const [attachError, setAttachError] = useState('');
   const [fileCache, setFileCache] = useState({});
@@ -652,18 +658,67 @@ function StudioComments() {
     await safeSet(NOTIF_PREFIX + targetUserId, JSON.stringify(list), true);
   }, []);
 
-  // 既知のニックネーム→userId の対応（在室者・会話履歴から集める簡易的な名簿）
+  // ニックネーム→userId の対応（永続登録簿。@メンションの解決に使う）
   const nicknameDirectoryRef = useRef({});
+
+  const registerNickname = useCallback(async (nick, uId) => {
+    if (!nick || !uId) return;
+    const raw = await safeGet(NICKNAME_REGISTRY_KEY, true);
+    let map = {};
+    try { map = raw ? JSON.parse(raw) : {}; } catch (e) { map = {}; }
+    if (map[nick] === uId) return;
+    map[nick] = uId;
+    nicknameDirectoryRef.current[nick] = uId;
+    await safeSet(NICKNAME_REGISTRY_KEY, JSON.stringify(map), true);
+  }, []);
+
+  const loadNicknameRegistry = useCallback(async () => {
+    const raw = await safeGet(NICKNAME_REGISTRY_KEY, true);
+    try {
+      const map = raw ? JSON.parse(raw) : {};
+      nicknameDirectoryRef.current = { ...nicknameDirectoryRef.current, ...map };
+    } catch (e) { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    if (!nicknameSet) return;
+    loadNicknameRegistry();
+    registerNickname(nickname, userId);
+    const t = setInterval(loadNicknameRegistry, 20000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nicknameSet, nickname, userId]);
+
   useEffect(() => {
     const dir = nicknameDirectoryRef.current;
     globalPresence.forEach((p) => { dir[p.nickname] = p.userId; });
     messages.forEach((m) => { if (m.nickname) dir[m.nickname] = m.userId; });
   }, [globalPresence, messages]);
 
-  const notifyMentions = useCallback((text, context) => {
+  const notifyMentions = useCallback(async (text, context) => {
     const names = extractMentions(text);
     if (names.length === 0) return;
     const dir = nicknameDirectoryRef.current;
+    const isAllMention = names.some((n) => n.toLowerCase() === 'all');
+    if (isAllMention) {
+      let map = {};
+      try {
+        const raw = await safeGet(NICKNAME_REGISTRY_KEY, true);
+        map = raw ? JSON.parse(raw) : {};
+      } catch (e) { map = {}; }
+      const targets = new Set([...Object.values(map), ...Object.values(dir)]);
+      targets.forEach((targetId) => {
+        if (targetId === userIdRef.current) return;
+        addNotification(targetId, {
+          type: 'mention',
+          fromNickname: nicknameRef.current,
+          text: text.slice(0, 60),
+          isAll: true,
+          ...context,
+        });
+      });
+      return;
+    }
     const seen = new Set();
     names.forEach((name) => {
       const targetId = dir[name];
@@ -946,6 +1001,23 @@ function StudioComments() {
   }, [messages]);
 
   useEffect(() => {
+    dmMessages.forEach((m) => {
+      if (!m.attachment) return;
+      const fileId = m.attachment.fileId;
+      if (fetchedFilesRef.current.has(fileId)) return;
+      fetchedFilesRef.current.add(fileId);
+      (async () => {
+        const raw = await safeGet(FILE_PREFIX + fileId, true);
+        if (!raw) return;
+        try {
+          const parsed = JSON.parse(raw);
+          setFileCache((prev) => ({ ...prev, [fileId]: parsed.dataUrl }));
+        } catch (e) { /* ignore malformed file entry */ }
+      })();
+    });
+  }, [dmMessages]);
+
+  useEffect(() => {
     moments.forEach((m) => {
       if (!m.imageFileId || fetchedFilesRef.current.has(m.imageFileId)) return;
       fetchedFilesRef.current.add(m.imageFileId);
@@ -1069,6 +1141,40 @@ function StudioComments() {
     setAttaching(false);
   };
 
+  const onPickDmFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    setDmAttachError('');
+    if (file.size > MAX_ORIGINAL_BYTES) {
+      setDmAttachError('ファイルが大きすぎます（8MB以下にしてください）');
+      return;
+    }
+    setDmAttaching(true);
+    try {
+      const isCompressible = file.type.startsWith('image/') && file.type !== 'image/gif';
+      if (isCompressible) {
+        const { dataUrl, width, height } = await compressImage(file);
+        setDmPendingAttachment({
+          name: file.name, mimeType: 'image/jpeg', dataUrl, kind: 'image',
+          size: approxBytesFromDataUrl(dataUrl), width, height,
+        });
+      } else {
+        if (file.size > MAX_NONIMAGE_BYTES) {
+          setDmAttachError('この形式のファイルは1.5MB以下にしてください');
+          setDmAttaching(false);
+          return;
+        }
+        const dataUrl = await readAsDataURL(file);
+        const kind = file.type.startsWith('image/') ? 'image' : 'file';
+        setDmPendingAttachment({ name: file.name, mimeType: file.type || 'application/octet-stream', dataUrl, kind, size: file.size });
+      }
+    } catch (err) {
+      setDmAttachError('ファイルを読み込めませんでした。');
+    }
+    setDmAttaching(false);
+  };
+
   const confirmNickname = async () => {
     const trimmed = nicknameInput.trim().slice(0, 16);
     if (!trimmed) return;
@@ -1110,6 +1216,7 @@ function StudioComments() {
     const trimmedNick = profileNicknameDraft.trim().slice(0, 16) || nickname;
     setNickname(trimmedNick);
     await safeSet(NICK_KEY, trimmedNick, false);
+    registerNickname(trimmedNick, userId);
     const newProfile = {
       icon: profileIconDraft, color: profileColorDraft,
       bio: profileBioDraft.trim().slice(0, BIO_MAX_LEN),
@@ -1486,6 +1593,8 @@ function StudioComments() {
     setActiveDmPeer({ userId: peerId, nickname: peerNickname || peerId });
     setDmMessages([]);
     setDmPeerReadAt(0);
+    setDmPendingAttachment(null);
+    setDmAttachError('');
     setView('dm-thread');
     loadDmMessages(peerId);
   };
@@ -1499,18 +1608,42 @@ function StudioComments() {
 
   const sendDm = async () => {
     const text = dmDraft.trim();
-    if (!text || !activeDmPeer || dmSending) return;
+    if ((!text && !dmPendingAttachment) || !activeDmPeer || dmSending) return;
     setDmSending(true);
+
+    let attachmentRef = null;
+    if (dmPendingAttachment) {
+      const fileId = uid();
+      const ok2 = await safeSet(
+        FILE_PREFIX + fileId,
+        JSON.stringify({ name: dmPendingAttachment.name, mimeType: dmPendingAttachment.mimeType, dataUrl: dmPendingAttachment.dataUrl }),
+        true
+      );
+      if (!ok2) {
+        setDmAttachError('添付ファイルの送信に失敗しました。');
+        setDmSending(false);
+        return;
+      }
+      attachmentRef = {
+        fileId, name: dmPendingAttachment.name, mimeType: dmPendingAttachment.mimeType,
+        kind: dmPendingAttachment.kind, size: dmPendingAttachment.size,
+        width: dmPendingAttachment.width, height: dmPendingAttachment.height,
+      };
+      fetchedFilesRef.current.add(fileId);
+      setFileCache((prev) => ({ ...prev, [fileId]: dmPendingAttachment.dataUrl }));
+    }
+
     const pairKey = dmKey(userId, activeDmPeer.userId);
     const raw = await safeGet(DM_PREFIX + pairKey, true);
     let list = parseList(raw);
-    const msg = { id: uid(), fromId: userId, fromNickname: nickname, text: text.slice(0, COMMENT_MAX_LEN), ts: Date.now() };
+    const msg = { id: uid(), fromId: userId, fromNickname: nickname, text: text.slice(0, COMMENT_MAX_LEN), ts: Date.now(), attachment: attachmentRef };
     list.push(msg);
     if (list.length > MAX_MESSAGES) list = list.slice(list.length - MAX_MESSAGES);
     const ok = await safeSet(DM_PREFIX + pairKey, JSON.stringify(list), true);
     if (ok) {
       setDmMessages(list);
       setDmDraft('');
+      setDmPendingAttachment(null);
       const idxRaw = await safeGet(DM_INDEX_KEY, true);
       let idxList = parseList(idxRaw);
       const [a, b] = [userId, activeDmPeer.userId].sort();
@@ -1518,7 +1651,7 @@ function StudioComments() {
         pairKey, userA: a, userB: b,
         nicknameA: a === userId ? nickname : activeDmPeer.nickname,
         nicknameB: b === userId ? nickname : activeDmPeer.nickname,
-        lastMessage: text.slice(0, 40), lastTs: msg.ts, lastSenderId: userId,
+        lastMessage: text ? text.slice(0, 40) : (attachmentRef ? `［${attachmentRef.kind === 'image' ? '画像' : attachmentRef.name}］` : ''), lastTs: msg.ts, lastSenderId: userId,
       };
       const exists = idxList.some((t) => t.pairKey === pairKey);
       idxList = exists ? idxList.map((t) => (t.pairKey === pairKey ? entry : t)) : [...idxList, entry];
@@ -2126,7 +2259,7 @@ function StudioComments() {
 
   useEffect(() => {
     visibleRooms.forEach((r) => {
-      [r.thumbFileId, r.bgFileId].forEach((fid) => {
+      [r.thumbFileId, r.bgFileId, r.bgmFileId].forEach((fid) => {
         if (!fid || roomThumbCache[fid]) return;
         (async () => {
           const fraw = await safeGet(FILE_PREFIX + fid, true);
@@ -2154,6 +2287,32 @@ function StudioComments() {
   }, [currentRoom, roomThumbCache]);
 
   useEffect(() => {
+    if (!currentRoom || !currentRoom.bgmFileId || roomThumbCache[currentRoom.bgmFileId]) return;
+    (async () => {
+      const fraw = await safeGet(FILE_PREFIX + currentRoom.bgmFileId, true);
+      if (!fraw) return;
+      try {
+        const fp = JSON.parse(fraw);
+        setRoomThumbCache((prev) => ({ ...prev, [currentRoom.bgmFileId]: fp.dataUrl }));
+      } catch (e) { /* ignore */ }
+    })();
+  }, [currentRoom, roomThumbCache]);
+
+  useEffect(() => {
+    setBgmEnabled(false);
+  }, [currentRoom && currentRoom.id]);
+
+  useEffect(() => {
+    const el = bgmAudioRef.current;
+    if (!el) return;
+    if (bgmEnabled) {
+      el.play().catch(() => setBgmEnabled(false));
+    } else {
+      el.pause();
+    }
+  }, [bgmEnabled, currentRoom && currentRoom.bgmFileId]);
+
+  useEffect(() => {
     if (view !== 'lobby' || visibleRooms.length === 0) return;
     let cancelled = false;
     const cutoff = () => Date.now() - PRESENCE_TTL;
@@ -2174,6 +2333,10 @@ function StudioComments() {
 
   const roomBgFileInputRef = useRef(null);
   const [roomBgUploading, setRoomBgUploading] = useState(false);
+  const roomBgmFileInputRef = useRef(null);
+  const [roomBgmUploading, setRoomBgmUploading] = useState(false);
+  const [bgmEnabled, setBgmEnabled] = useState(false);
+  const bgmAudioRef = useRef(null);
 
   if (!nickReady) {
     return (
@@ -2248,6 +2411,41 @@ function StudioComments() {
   const clearRoomBg = async () => {
     if (!currentRoom || !isAdmin) return;
     await updateRoomField((r) => ({ ...r, bgFileId: null }));
+  };
+
+  const onPickRoomBgm = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file || !currentRoom || !isAdmin) return;
+    if (!file.type.startsWith('audio/')) {
+      setError('音声ファイルを選んでください。');
+      return;
+    }
+    if (file.size > MAX_BGM_BYTES) {
+      setError('BGMファイルが大きすぎます（5MB以下にしてください）');
+      return;
+    }
+    setRoomBgmUploading(true);
+    try {
+      const dataUrl = await readAsDataURL(file);
+      const fileId = uid();
+      const ok = await safeSet(FILE_PREFIX + fileId, JSON.stringify({ name: file.name, mimeType: file.type, dataUrl }), true);
+      if (ok) {
+        await updateRoomField((r) => ({ ...r, bgmFileId: fileId, bgmName: file.name }));
+        setRoomThumbCache((prev) => ({ ...prev, [fileId]: dataUrl }));
+      } else {
+        setError('BGMのアップロードに失敗しました。');
+      }
+    } catch (err) {
+      setError('BGMファイルを読み込めませんでした。');
+    }
+    setRoomBgmUploading(false);
+  };
+
+  const clearRoomBgm = async () => {
+    if (!currentRoom || !isAdmin) return;
+    setBgmEnabled(false);
+    await updateRoomField((r) => ({ ...r, bgmFileId: null, bgmName: null }));
   };
 
   const onPickRoomThumb = async (e) => {
@@ -2491,6 +2689,11 @@ function StudioComments() {
               <button className={`sc-icon-btn ${autoScrollEnabled ? 'active' : ''}`} title={autoScrollEnabled ? '自動スクロール: ON' : '自動スクロール: OFF'} onClick={() => setAutoScrollEnabled((v) => !v)}>
                 <ArrowDownCircle size={16} />
               </button>
+              {currentRoom.bgmFileId && (
+                <button className={`sc-icon-btn ${bgmEnabled ? 'active' : ''}`} title={bgmEnabled ? 'BGMを止める' : 'BGMを再生'} onClick={() => setBgmEnabled((v) => !v)}>
+                  {bgmEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+                </button>
+              )}
               <button className={`sc-icon-btn ${analyticsOpen ? 'active' : ''}`} title="会話の分析" onClick={() => { setAnalyticsOpen((v) => !v); setAdminPanelOpen(false); setLogsOpen(false); }}>
                 <BarChart3 size={16} />
               </button>
@@ -2591,6 +2794,18 @@ function StudioComments() {
                   </button>
                   {currentRoom.bgFileId && (
                     <button className="sc-action-link" style={{ border: '1px solid var(--line)', borderRadius: 5, flexShrink: 0, padding: '5px 8px' }} onClick={clearRoomBg} title="背景を元に戻す">
+                      <X size={12} />
+                    </button>
+                  )}
+                </div>
+
+                <input type="file" ref={roomBgmFileInputRef} style={{ display: 'none' }} onChange={onPickRoomBgm} accept="audio/*" />
+                <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+                  <button className="sc-action-link" style={{ border: '1px solid var(--line)', borderRadius: 5, flex: 1, justifyContent: 'center', padding: '5px 0' }} onClick={() => roomBgmFileInputRef.current?.click()} disabled={roomBgmUploading}>
+                    {roomBgmUploading ? <Loader2 className="animate-spin" size={12} /> : <Music size={12} />} BGMを設定{currentRoom.bgmName ? `（${currentRoom.bgmName}）` : ''}
+                  </button>
+                  {currentRoom.bgmFileId && (
+                    <button className="sc-action-link" style={{ border: '1px solid var(--line)', borderRadius: 5, flexShrink: 0, padding: '5px 8px' }} onClick={clearRoomBgm} title="BGMを削除">
                       <X size={12} />
                     </button>
                   )}
@@ -2774,6 +2989,10 @@ function StudioComments() {
               コメント（{messages.filter((m) => !m.deleted).length}）
             </div>
           </div>
+
+          {currentRoom.bgmFileId && roomThumbCache[currentRoom.bgmFileId] && (
+            <audio ref={bgmAudioRef} src={roomThumbCache[currentRoom.bgmFileId]} loop style={{ display: 'none' }} />
+          )}
 
           <div
             ref={messagesScrollRef}
@@ -3115,6 +3334,7 @@ function StudioComments() {
                       border: mine ? 'none' : '1px solid var(--line)', borderRadius: 10, padding: '7px 11px', fontSize: 13, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                     }}>
                       {renderRichText(m.text)}
+                      {renderAttachment(m)}
                       <div style={{ fontSize: 9.5, opacity: 0.75, marginTop: 3 }}>{fmtRelative(m.ts)}</div>
                     </div>
                     {isLastMine && dmPeerReadAt >= m.ts && (
@@ -3130,26 +3350,50 @@ function StudioComments() {
               </div>
             )}
           </div>
-          <div style={{ borderTop: '1px solid var(--line)', padding: '10px 14px', flexShrink: 0, background: 'var(--panel-alt)', display: 'flex', gap: 8 }}>
-            <input
-              className="sc-input flex-1 rounded-lg px-3 py-2 text-sm"
-              placeholder="メッセージを入力"
-              maxLength={COMMENT_MAX_LEN}
-              value={dmDraft}
-              onChange={(e) => {
-                setDmDraft(e.target.value);
-                if (!activeDmPeer) return;
-                const now = Date.now();
-                if (now - lastDmTypingSentRef.current > 1500) {
-                  lastDmTypingSentRef.current = now;
-                  sendTypingBeat('dm:' + dmKey(userId, activeDmPeer.userId), userId, nickname);
-                }
-              }}
-              onKeyDown={(e) => { if (e.key === 'Enter') sendDm(); }}
-            />
-            <button className="sc-btn-primary sc-post-btn" disabled={!dmDraft.trim() || dmSending} onClick={sendDm}>
-              {dmSending ? <Loader2 className="animate-spin" size={14} /> : '送信'}
-            </button>
+          <div style={{ borderTop: '1px solid var(--line)', flexShrink: 0, background: 'var(--panel-alt)' }}>
+            {dmAttachError && (
+              <div style={{ padding: '4px 14px 0', fontSize: 10.5, color: 'var(--danger-deep)' }}>{dmAttachError}</div>
+            )}
+            {dmPendingAttachment && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px 0' }}>
+                {dmPendingAttachment.kind === 'image' ? (
+                  <img src={dmPendingAttachment.dataUrl} alt="" style={{ width: 36, height: 36, objectFit: 'cover', borderRadius: 4, flexShrink: 0 }} />
+                ) : (
+                  <Paperclip size={16} style={{ flexShrink: 0 }} />
+                )}
+                <div style={{ fontSize: 11.5, color: 'var(--ink)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {dmPendingAttachment.name} <span style={{ color: 'var(--ink-soft)' }}>({formatSize(dmPendingAttachment.size)})</span>
+                </div>
+                <button onClick={() => setDmPendingAttachment(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ink-soft)' }}>
+                  <X size={14} />
+                </button>
+              </div>
+            )}
+            <div style={{ padding: '10px 14px', display: 'flex', gap: 8 }}>
+              <input type="file" ref={dmFileInputRef} style={{ display: 'none' }} onChange={onPickDmFile} />
+              <button className="sc-icon-btn" onClick={() => dmFileInputRef.current?.click()} disabled={dmAttaching} title="ファイルを添付">
+                {dmAttaching ? <Loader2 className="animate-spin" size={16} /> : <Paperclip size={16} />}
+              </button>
+              <input
+                className="sc-input flex-1 rounded-lg px-3 py-2 text-sm"
+                placeholder="メッセージを入力"
+                maxLength={COMMENT_MAX_LEN}
+                value={dmDraft}
+                onChange={(e) => {
+                  setDmDraft(e.target.value);
+                  if (!activeDmPeer) return;
+                  const now = Date.now();
+                  if (now - lastDmTypingSentRef.current > 1500) {
+                    lastDmTypingSentRef.current = now;
+                    sendTypingBeat('dm:' + dmKey(userId, activeDmPeer.userId), userId, nickname);
+                  }
+                }}
+                onKeyDown={(e) => { if (e.key === 'Enter') sendDm(); }}
+              />
+              <button className="sc-btn-primary sc-post-btn" disabled={(!dmDraft.trim() && !dmPendingAttachment) || dmSending} onClick={sendDm}>
+                {dmSending ? <Loader2 className="animate-spin" size={14} /> : '送信'}
+              </button>
+            </div>
           </div>
         </>
       )}
@@ -3231,7 +3475,7 @@ function StudioComments() {
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 12, color: 'var(--ink-strong)' }}>
                       <span style={{ fontWeight: 700 }}>{n.fromNickname}</span>
-                      さんがメンションしました
+                      {n.isAll ? 'さんが全員にメンションしました' : 'さんがメンションしました'}
                       {n.roomName ? `（${n.roomName}）` : n.projectTitle ? `（${n.projectTitle}）` : ''}
                     </div>
                     <div style={{ fontSize: 11.5, color: 'var(--ink-soft)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.text}</div>
