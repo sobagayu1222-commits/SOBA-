@@ -4,12 +4,16 @@ import {
   Ban, Folder, History, Search, Copy, Lock, UserPlus, Eye, Settings, Check,
   Mic, MicOff, PhoneCall, PhoneOff, BarChart3, MessageCircle, Image as ImageIcon,
   Smile, Sticker, Link2, Home, LayoutGrid, Camera, Edit3, Info,
-  ArrowDownCircle, ChevronsLeft, ChevronsRight, KeyRound,
+  ArrowDownCircle, ChevronsLeft, ChevronsRight, KeyRound, Bell, Music, Volume2, VolumeX,
 } from 'lucide-react';
 
 const FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');";
 
 const ROOMS_KEY = 'studio:rooms';
+const NOTIF_PREFIX = 'studio:notif:';
+const ANNOUNCEMENT_KEY = 'studio:announcement';
+const URL_REGEX = /(https?:\/\/[^\s<>"']+)/g;
+const MENTION_REGEX = /@([^\s@]{1,20})/g;
 const SITE_ADMIN_PASSPHRASE = 'SOBA=WES';
 const GLOBAL_PRESENCE_KEY = 'studio:global-presence';
 const GLOBAL_PRESENCE_TTL = 20000;
@@ -171,6 +175,35 @@ function parseList(raw) {
   } catch (e) {
     return [];
   }
+}
+
+function extractMentions(text) {
+  if (!text) return [];
+  const out = [];
+  let m;
+  MENTION_REGEX.lastIndex = 0;
+  while ((m = MENTION_REGEX.exec(text))) out.push(m[1]);
+  return out;
+}
+
+function renderRichText(text) {
+  if (!text) return null;
+  const tokens = text.split(/(https?:\/\/[^\s<>"']+|@[^\s@]{1,20})/g).filter((t) => t !== '');
+  return tokens.map((tok, i) => {
+    if (/^https?:\/\//.test(tok)) {
+      return (
+        <a key={i} href={tok} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--link)', wordBreak: 'break-all', textDecoration: 'underline' }} onClick={(e) => e.stopPropagation()}>
+          {tok}
+        </a>
+      );
+    }
+    if (/^@[^\s@]{1,20}$/.test(tok)) {
+      return (
+        <span key={i} style={{ color: 'var(--owner)', fontWeight: 700 }}>{tok}</span>
+      );
+    }
+    return <span key={i}>{tok}</span>;
+  });
 }
 
 function parseObj(raw, fallback) {
@@ -339,7 +372,7 @@ function IdTag({ userId: uId }) {
 
 function MessageText({ text, onJump }) {
   if (!text) return null;
-  const parts = text.split(/(#msg:[a-zA-Z0-9]+)/g);
+  const parts = text.split(/(#msg:[a-zA-Z0-9]+|https?:\/\/[^\s<>"']+|@[^\s@]{1,20})/g).filter((t) => t !== '');
   return (
     <>
       {parts.map((part, i) => {
@@ -358,6 +391,16 @@ function MessageText({ text, onJump }) {
               <Link2 size={10} />{part}
             </button>
           );
+        }
+        if (/^https?:\/\//.test(part)) {
+          return (
+            <a key={i} href={part} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--link)', wordBreak: 'break-all', textDecoration: 'underline' }} onClick={(e) => e.stopPropagation()}>
+              {part}
+            </a>
+          );
+        }
+        if (/^@[^\s@]{1,20}$/.test(part)) {
+          return <span key={i} style={{ color: 'var(--owner)', fontWeight: 700 }}>{part}</span>;
         }
         return <span key={i}>{part}</span>;
       })}
@@ -411,6 +454,7 @@ function StudioComments() {
   const [avatarCache, setAvatarCache] = useState({});
   const [roomThumbCache, setRoomThumbCache] = useState({});
   const [lobbyPresenceMap, setLobbyPresenceMap] = useState({});
+  const [roomLastSeenMap, setRoomLastSeenMap] = useState({});
   const roomThumbFileInputRef = useRef(null);
   const [roomThumbUploading, setRoomThumbUploading] = useState(false);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
@@ -444,6 +488,10 @@ function StudioComments() {
   const [momentsLastSeen, setMomentsLastSeen] = useState(0);
   const [projectsLastSeen, setProjectsLastSeen] = useState(0);
   const [dmDraft, setDmDraft] = useState('');
+  const [dmPeerTyping, setDmPeerTyping] = useState(false);
+  const [projectChatTypingUsers, setProjectChatTypingUsers] = useState([]);
+  const lastDmTypingSentRef = useRef(0);
+  const lastProjectTypingSentRef = useRef(0);
   const [dmSending, setDmSending] = useState(false);
   const [dmStartIdInput, setDmStartIdInput] = useState('');
   const [dmMonitorThreads, setDmMonitorThreads] = useState([]);
@@ -464,6 +512,8 @@ function StudioComments() {
   const [projectDescDraft, setProjectDescDraft] = useState('');
   const [projectImageDraft, setProjectImageDraft] = useState(null);
   const [projectImageUpdating, setProjectImageUpdating] = useState(false);
+  const [editingProjectDesc, setEditingProjectDesc] = useState(false);
+  const [projectDescEditDraft, setProjectDescEditDraft] = useState('');
   const projectImageEditInputRef = useRef(null);
   const [projectPosting, setProjectPosting] = useState(false);
   const [activeProject, setActiveProject] = useState(null);
@@ -524,6 +574,8 @@ function StudioComments() {
   const localStreamRef = useRef(null);
   const processedSignalIdsRef = useRef(new Set());
   useEffect(() => { userIdRef.current = userId; }, [userId]);
+  const nicknameRef = useRef('');
+  useEffect(() => { nicknameRef.current = nickname; }, [nickname]);
   const siteAdminRef = useRef(false);
   useEffect(() => { siteAdminRef.current = siteAdminUnlocked; }, [siteAdminUnlocked]);
 
@@ -550,6 +602,8 @@ function StudioComments() {
         if (ms) setMomentsLastSeen(Number(ms));
         const ps = window.localStorage.getItem('studio:lastseen:projects');
         if (ps) setProjectsLastSeen(Number(ps));
+        const rs = window.localStorage.getItem('studio:lastseen:rooms');
+        if (rs) { try { setRoomLastSeenMap(JSON.parse(rs)); } catch (e) {} }
       } catch (e) {}
     })();
   }, []);
@@ -586,6 +640,132 @@ function StudioComments() {
     } else {
       setAdminPassError('合言葉が違います');
     }
+  };
+
+  // ---- 通知（メンション・お知らせ） ----
+  const addNotification = useCallback(async (targetUserId, entry) => {
+    if (!targetUserId || targetUserId === userIdRef.current) return;
+    const raw = await safeGet(NOTIF_PREFIX + targetUserId, true);
+    let list = parseList(raw);
+    list.unshift({ id: uid(), ts: Date.now(), ...entry });
+    list = list.slice(0, 100);
+    await safeSet(NOTIF_PREFIX + targetUserId, JSON.stringify(list), true);
+  }, []);
+
+  // 既知のニックネーム→userId の対応（在室者・会話履歴から集める簡易的な名簿）
+  const nicknameDirectoryRef = useRef({});
+  useEffect(() => {
+    const dir = nicknameDirectoryRef.current;
+    globalPresence.forEach((p) => { dir[p.nickname] = p.userId; });
+    messages.forEach((m) => { if (m.nickname) dir[m.nickname] = m.userId; });
+  }, [globalPresence, messages]);
+
+  const notifyMentions = useCallback((text, context) => {
+    const names = extractMentions(text);
+    if (names.length === 0) return;
+    const dir = nicknameDirectoryRef.current;
+    const seen = new Set();
+    names.forEach((name) => {
+      const targetId = dir[name];
+      if (!targetId || seen.has(targetId)) return;
+      seen.add(targetId);
+      addNotification(targetId, {
+        type: 'mention',
+        fromNickname: nicknameRef.current,
+        text: text.slice(0, 60),
+        ...context,
+      });
+    });
+  }, [addNotification]);
+
+  const [notifications, setNotifications] = useState([]);
+  const [notifLastSeen, setNotifLastSeen] = useState(0);
+  const notifPollRef = useRef(null);
+
+  const loadNotifications = useCallback(async () => {
+    const raw = await safeGet(NOTIF_PREFIX + userIdRef.current, true);
+    setNotifications(parseList(raw));
+  }, []);
+
+  useEffect(() => {
+    if (!nicknameSet) return;
+    loadNotifications();
+    notifPollRef.current = setInterval(loadNotifications, 8000);
+    try {
+      const ls = window.localStorage.getItem('studio:lastseen:notif');
+      if (ls) setNotifLastSeen(Number(ls));
+    } catch (e) {}
+    return () => clearInterval(notifPollRef.current);
+  }, [nicknameSet, loadNotifications]);
+
+  const notifUnreadCount = notifications.filter((n) => n.ts > notifLastSeen).length;
+
+  const openNotifications = () => {
+    setView('notifications');
+    loadNotifications();
+    const now = Date.now();
+    setNotifLastSeen(now);
+    try { window.localStorage.setItem('studio:lastseen:notif', String(now)); } catch (e) {}
+  };
+
+  const goToNotification = (n) => {
+    if (n.type === 'mention' && n.roomId) {
+      const r = rooms.find((rr) => rr.id === n.roomId);
+      if (r) { enterRoom(r); return; }
+    }
+    if (n.type === 'mention' && n.projectId) {
+      const p = projects.find((pp) => pp.id === n.projectId);
+      if (p) { openProject(p); setProjectDetailTab('chat'); return; }
+    }
+    if (n.type === 'mention' && n.dmPeerId) {
+      openDmWith(n.dmPeerId, n.fromNickname);
+      return;
+    }
+  };
+
+  // ---- 運営からのお知らせ ----
+  const [announcement, setAnnouncement] = useState(null);
+  const [announcementDraft, setAnnouncementDraft] = useState('');
+  const [announcementDismissed, setAnnouncementDismissed] = useState(false);
+
+  const loadAnnouncement = useCallback(async () => {
+    const raw = await safeGet(ANNOUNCEMENT_KEY, true);
+    try {
+      const parsed = raw ? JSON.parse(raw) : null;
+      setAnnouncement(parsed);
+    } catch (e) { setAnnouncement(null); }
+  }, []);
+
+  useEffect(() => {
+    if (!nicknameSet) return;
+    loadAnnouncement();
+    const t = setInterval(loadAnnouncement, 20000);
+    try {
+      const dismissedId = window.localStorage.getItem('studio:announcement-dismissed');
+      if (dismissedId) setAnnouncementDismissed(dismissedId);
+    } catch (e) {}
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nicknameSet]);
+
+  const postAnnouncement = async () => {
+    if (!siteAdminUnlocked || !announcementDraft.trim()) return;
+    const entry = { id: uid(), text: announcementDraft.trim().slice(0, 300), ts: Date.now(), fromNickname: nickname };
+    await safeSet(ANNOUNCEMENT_KEY, JSON.stringify(entry), true);
+    setAnnouncement(entry);
+    setAnnouncementDraft('');
+  };
+
+  const clearAnnouncement = async () => {
+    if (!siteAdminUnlocked) return;
+    await safeSet(ANNOUNCEMENT_KEY, JSON.stringify(null), true);
+    setAnnouncement(null);
+  };
+
+  const dismissAnnouncement = () => {
+    if (!announcement) return;
+    setAnnouncementDismissed(announcement.id);
+    try { window.localStorage.setItem('studio:announcement-dismissed', announcement.id); } catch (e) {}
   };
 
   const ensureProfiles = useCallback((ids) => {
@@ -985,6 +1165,11 @@ function StudioComments() {
     }
     setError('');
     setCurrentRoom(room);
+    setRoomLastSeenMap((prev) => {
+      const next = { ...prev, [room.id]: Date.now() };
+      try { window.localStorage.setItem('studio:lastseen:rooms', JSON.stringify(next)); } catch (e) {}
+      return next;
+    });
     lastMessagesRawRef.current = '';
     setMessages([]);
     setPresence([]);
@@ -1066,8 +1251,9 @@ function StudioComments() {
       await beatRead(currentRoom.id, userId, nickname);
       const rawRooms = await safeGet(ROOMS_KEY, true);
       let rlist = parseList(rawRooms);
-      rlist = rlist.map((r) => (r.id === currentRoom.id ? { ...r, messageCount: list.length, lastActivity: msg.ts } : r));
+      rlist = rlist.map((r) => (r.id === currentRoom.id ? { ...r, messageCount: list.length, lastActivity: msg.ts, lastSenderId: userId } : r));
       await safeSet(ROOMS_KEY, JSON.stringify(rlist), true);
+      notifyMentions(text, { roomId: currentRoom.id, roomName: currentRoom.name });
     } else {
       setError('投稿に失敗しました。もう一度お試しください。');
     }
@@ -1094,7 +1280,7 @@ function StudioComments() {
       setStampPickerOpen(false);
       const rawRooms = await safeGet(ROOMS_KEY, true);
       let rlist = parseList(rawRooms);
-      rlist = rlist.map((r) => (r.id === currentRoom.id ? { ...r, messageCount: list.length, lastActivity: msg.ts } : r));
+      rlist = rlist.map((r) => (r.id === currentRoom.id ? { ...r, messageCount: list.length, lastActivity: msg.ts, lastSenderId: userId } : r));
       await safeSet(ROOMS_KEY, JSON.stringify(rlist), true);
     }
     setSending(false);
@@ -1285,6 +1471,10 @@ function StudioComments() {
       const pmap = praw ? JSON.parse(praw) : {};
       setDmPeerReadAt(pmap[pairKey] || 0);
     } catch (e) { setDmPeerReadAt(0); }
+    const traw = await safeGet(TYPING_PREFIX + 'dm:' + pairKey, true);
+    const tlist = parseList(traw);
+    const cutoff = Date.now() - TYPING_TTL;
+    setDmPeerTyping(tlist.some((t) => t.userId === peerId && t.lastTyping >= cutoff));
   }, [markDmRead]);
 
   const openDmWith = (peerId, peerNickname) => {
@@ -1475,6 +1665,18 @@ function StudioComments() {
     }
   };
 
+  const updateProjectDescription = async (project, newDesc) => {
+    if (!project || (project.authorId !== userId && !siteAdminUnlocked)) return;
+    const raw = await safeGet(PROJECTS_KEY, true);
+    const list = parseList(raw).map((p) => (p.id === project.id ? { ...p, description: newDesc } : p));
+    const ok = await safeSet(PROJECTS_KEY, JSON.stringify(list), true);
+    if (ok) {
+      setProjects(list);
+      setActiveProject((prev) => (prev && prev.id === project.id ? { ...prev, description: newDesc } : prev));
+    }
+    return ok;
+  };
+
   const updateProjectImage = async (project, dataUrl) => {
     if (!project || (project.authorId !== userId && !siteAdminUnlocked)) return;
     setProjectImageUpdating(true);
@@ -1546,6 +1748,7 @@ function StudioComments() {
     lastProjectChatRawRef.current = '';
     setProjectChatMessages([]);
     setProjectDetailTab('comments');
+    setEditingProjectDesc(false);
     setView('project-detail');
     loadProjectComments(project.id);
   };
@@ -1566,9 +1769,14 @@ function StudioComments() {
   const loadProjectChat = useCallback(async (projectId) => {
     const raw = await safeGet(PROJECT_CHAT_PREFIX + projectId, true);
     const rawStr = raw || '';
-    if (rawStr === lastProjectChatRawRef.current) return;
-    lastProjectChatRawRef.current = rawStr;
-    setProjectChatMessages(parseList(raw));
+    if (rawStr !== lastProjectChatRawRef.current) {
+      lastProjectChatRawRef.current = rawStr;
+      setProjectChatMessages(parseList(raw));
+    }
+    const traw = await safeGet(TYPING_PREFIX + 'project:' + projectId, true);
+    const tlist = parseList(traw);
+    const cutoff = Date.now() - TYPING_TTL;
+    setProjectChatTypingUsers(tlist.filter((t) => t.lastTyping >= cutoff && t.userId !== userIdRef.current));
   }, []);
 
   useEffect(() => {
@@ -1595,6 +1803,7 @@ function StudioComments() {
     if (ok) {
       setProjectChatMessages(list);
       setProjectChatDraft('');
+      notifyMentions(text, { projectId: activeProject.id, projectTitle: activeProject.title });
     }
     setProjectChatSending(false);
   };
@@ -1913,6 +2122,7 @@ function StudioComments() {
   `;
 
   const visibleRooms = rooms.filter((r) => canView(r, userId));
+  const roomsUnreadCount = visibleRooms.filter((r) => r.lastSenderId && r.lastSenderId !== userId && r.lastActivity > (roomLastSeenMap[r.id] || 0)).length;
 
   useEffect(() => {
     visibleRooms.forEach((r) => {
@@ -2113,6 +2323,18 @@ function StudioComments() {
     <div className="sc-scope w-full overflow-hidden" style={shellStyle}>
       <style>{customCss}</style>
 
+      {announcement && announcementDismissed !== announcement.id && (
+        <div style={{ background: '#FFF4D6', borderBottom: '1px solid #E8D9A6', padding: '8px 14px', display: 'flex', alignItems: 'flex-start', gap: 8, flexShrink: 0 }}>
+          <Info size={13} style={{ marginTop: 1, flexShrink: 0, color: '#8A6D00' }} />
+          <div style={{ flex: 1, fontSize: 11.5, color: '#5C4A00', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {announcement.text}
+          </div>
+          <button onClick={dismissAnnouncement} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#8A6D00', flexShrink: 0 }}>
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
       {view === 'lobby' && (
         <>
           <div style={{ background: 'var(--owner)', padding: '14px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
@@ -2124,11 +2346,21 @@ function StudioComments() {
                 マイスタジオ
               </h1>
             </div>
-            <button onClick={openProfileModal} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.14)', border: 'none', borderRadius: 20, padding: '3px 10px 3px 3px', cursor: 'pointer' }}>
-              <Avatar userId={userId} nickname={nickname} profiles={profiles} avatarCache={avatarCache} size={24} />
-              <span style={{ fontSize: 12.5, color: '#EAF2FF', fontWeight: 600 }}>{nickname}</span>
-              <Settings size={13} color="#EAF2FF" />
-            </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <button onClick={openNotifications} style={{ position: 'relative', background: 'rgba(255,255,255,0.14)', border: 'none', borderRadius: '50%', width: 30, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+                <Bell size={15} color="#EAF2FF" />
+                {notifUnreadCount > 0 && (
+                  <span style={{ position: 'absolute', top: -2, right: -2, minWidth: 14, height: 14, padding: '0 3px', borderRadius: 7, background: 'var(--danger)', color: '#fff', fontSize: 9, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {notifUnreadCount > 9 ? '9+' : notifUnreadCount}
+                  </span>
+                )}
+              </button>
+              <button onClick={openProfileModal} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.14)', border: 'none', borderRadius: 20, padding: '3px 10px 3px 3px', cursor: 'pointer' }}>
+                <Avatar userId={userId} nickname={nickname} profiles={profiles} avatarCache={avatarCache} size={24} />
+                <span style={{ fontSize: 12.5, color: '#EAF2FF', fontWeight: 600 }}>{nickname}</span>
+                <Settings size={13} color="#EAF2FF" />
+              </button>
+            </div>
           </div>
 
           <div className="sc-scroll" style={{ flex: 1, overflowY: 'auto', padding: '18px' }}>
@@ -2155,6 +2387,7 @@ function StudioComments() {
                 {visibleRooms.map((r) => {
                   const roomOnline = (lobbyPresenceMap[r.id] || []).filter((p) => p.userId !== userId);
                   const thumbUrl = r.thumbFileId ? roomThumbCache[r.thumbFileId] : null;
+                  const roomUnread = !!(r.lastSenderId && r.lastSenderId !== userId && r.lastActivity > (roomLastSeenMap[r.id] || 0));
                   return (
                   <button key={r.id} className="sc-room-card" onClick={() => enterRoom(r)}>
                     <div style={{ position: 'relative', height: 64, background: 'var(--panel-alt)', display: 'flex', alignItems: 'center', justifyContent: 'center', borderBottom: '1px solid var(--line)', overflow: 'hidden' }}>
@@ -2162,6 +2395,9 @@ function StudioComments() {
                         <img src={thumbUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                       ) : (
                         <Folder size={22} color="var(--ink-soft)" />
+                      )}
+                      {roomUnread && (
+                        <div style={{ position: 'absolute', top: 6, left: 6, width: 9, height: 9, borderRadius: '50%', background: 'var(--danger)', border: '2px solid #fff' }} />
                       )}
                       {r.private && (
                         <div style={{ position: 'absolute', top: 6, right: 6, background: 'rgba(59,58,56,0.8)', borderRadius: 5, padding: '2px 5px', display: 'flex', alignItems: 'center', gap: 3 }}>
@@ -2878,7 +3114,7 @@ function StudioComments() {
                       maxWidth: '75%', background: mine ? 'var(--owner)' : 'var(--panel)', color: mine ? '#fff' : 'var(--ink)',
                       border: mine ? 'none' : '1px solid var(--line)', borderRadius: 10, padding: '7px 11px', fontSize: 13, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                     }}>
-                      {m.text}
+                      {renderRichText(m.text)}
                       <div style={{ fontSize: 9.5, opacity: 0.75, marginTop: 3 }}>{fmtRelative(m.ts)}</div>
                     </div>
                     {isLastMine && dmPeerReadAt >= m.ts && (
@@ -2888,6 +3124,11 @@ function StudioComments() {
                 );
               })
             )}
+            {dmPeerTyping && (
+              <div style={{ fontSize: 11, color: 'var(--ink-soft)', fontStyle: 'italic', marginTop: 2 }}>
+                {activeDmPeer.nickname}さんが入力中…
+              </div>
+            )}
           </div>
           <div style={{ borderTop: '1px solid var(--line)', padding: '10px 14px', flexShrink: 0, background: 'var(--panel-alt)', display: 'flex', gap: 8 }}>
             <input
@@ -2895,7 +3136,15 @@ function StudioComments() {
               placeholder="メッセージを入力"
               maxLength={COMMENT_MAX_LEN}
               value={dmDraft}
-              onChange={(e) => setDmDraft(e.target.value)}
+              onChange={(e) => {
+                setDmDraft(e.target.value);
+                if (!activeDmPeer) return;
+                const now = Date.now();
+                if (now - lastDmTypingSentRef.current > 1500) {
+                  lastDmTypingSentRef.current = now;
+                  sendTypingBeat('dm:' + dmKey(userId, activeDmPeer.userId), userId, nickname);
+                }
+              }}
               onKeyDown={(e) => { if (e.key === 'Enter') sendDm(); }}
             />
             <button className="sc-btn-primary sc-post-btn" disabled={!dmDraft.trim() || dmSending} onClick={sendDm}>
@@ -2948,11 +3197,49 @@ function StudioComments() {
                   <div key={m.id} style={{ marginBottom: 8, fontSize: 12.5 }}>
                     <span style={{ fontWeight: 700, color: 'var(--link)' }}>{m.fromNickname}</span>
                     <span style={{ color: 'var(--ink-soft)', marginLeft: 6, fontSize: 10 }}>{fmtRelative(m.ts)}</span>
-                    <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', marginTop: 2 }}>{m.text}</div>
+                    <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', marginTop: 2 }}>{renderRichText(m.text)}</div>
                   </div>
                 ))
               )}
             </div>
+          </div>
+        </>
+      )}
+
+      {view === 'notifications' && (
+        <>
+          <div style={{ background: 'var(--owner)', padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+            <button onClick={() => setView('lobby')} style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', display: 'flex' }}>
+              <ArrowLeft size={18} />
+            </button>
+            <div style={{ fontWeight: 800, fontSize: 15, color: '#fff' }}>通知</div>
+          </div>
+          <div className="sc-scroll" style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
+            {notifications.length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--ink-soft)' }}>まだ通知はありません。メンションされると、ここに表示されます。</div>
+            ) : (
+              notifications.map((n) => (
+                <button
+                  key={n.id}
+                  onClick={() => goToNotification(n)}
+                  className="sc-feed-btn"
+                  style={{ display: 'flex', gap: 10, padding: 10, width: '100%', textAlign: 'left', marginBottom: 6 }}
+                >
+                  <div style={{ width: 28, height: 28, borderRadius: '50%', background: 'var(--panel-alt)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <MessageCircle size={13} color="var(--owner)" />
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12, color: 'var(--ink-strong)' }}>
+                      <span style={{ fontWeight: 700 }}>{n.fromNickname}</span>
+                      さんがメンションしました
+                      {n.roomName ? `（${n.roomName}）` : n.projectTitle ? `（${n.projectTitle}）` : ''}
+                    </div>
+                    <div style={{ fontSize: 11.5, color: 'var(--ink-soft)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.text}</div>
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--ink-soft)', flexShrink: 0 }}>{fmtRelative(n.ts)}</div>
+                </button>
+              ))
+            )}
           </div>
         </>
       )}
@@ -3036,7 +3323,7 @@ function StudioComments() {
                         </button>
                       )}
                     </div>
-                    {m.text && <div style={{ fontSize: 13, color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', marginBottom: m.imageFileId ? 8 : 0 }}>{m.text}</div>}
+                    {m.text && <div style={{ fontSize: 13, color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', marginBottom: m.imageFileId ? 8 : 0 }}>{renderRichText(m.text)}</div>}
                     {m.imageFileId && (
                       fileCache[m.imageFileId] ? (
                         <img src={fileCache[m.imageFileId]} alt="" onClick={() => setLightbox(fileCache[m.imageFileId])} style={{ width: '100%', maxHeight: 260, objectFit: 'cover', borderRadius: 8, cursor: 'zoom-in' }} />
@@ -3165,8 +3452,40 @@ function StudioComments() {
                 <div style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--ink-strong)' }}>{activeProject.authorNickname}</div>
                 <div style={{ fontSize: 10.5, color: 'var(--ink-soft)' }}>{fmtRelative(activeProject.ts)}</div>
               </div>
-              {activeProject.description && (
-                <div style={{ fontSize: 13, color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.7, marginBottom: 16 }}>{activeProject.description}</div>
+              {editingProjectDesc ? (
+                <div style={{ marginBottom: 16 }}>
+                  <textarea
+                    className="sc-input rounded-lg px-3 py-2 text-sm"
+                    style={{ width: '100%', boxSizing: 'border-box', minHeight: 80, resize: 'vertical' }}
+                    value={projectDescEditDraft}
+                    maxLength={2000}
+                    onChange={(e) => setProjectDescEditDraft(e.target.value)}
+                    autoFocus
+                  />
+                  <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                    <button className="sc-action-link" style={{ border: '1px solid var(--owner)', color: 'var(--owner)', borderRadius: 5, padding: '4px 10px' }} onClick={async () => { await updateProjectDescription(activeProject, projectDescEditDraft.trim()); setEditingProjectDesc(false); }}>
+                      保存
+                    </button>
+                    <button className="sc-action-link" style={{ border: '1px solid var(--line)', borderRadius: 5, padding: '4px 10px' }} onClick={() => setEditingProjectDesc(false)}>
+                      キャンセル
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {activeProject.description && (
+                    <div style={{ fontSize: 13, color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.7, marginBottom: 8 }}>{renderRichText(activeProject.description)}</div>
+                  )}
+                  {(activeProject.authorId === userId || siteAdminUnlocked) && (
+                    <button
+                      className="sc-action-link"
+                      style={{ marginBottom: 16, color: 'var(--ink-soft)' }}
+                      onClick={() => { setProjectDescEditDraft(activeProject.description || ''); setEditingProjectDesc(true); }}
+                    >
+                      <Edit3 size={11} /> 説明を編集
+                    </button>
+                  )}
+                </>
               )}
               <div style={{ display: 'flex', gap: 6, borderTop: '1px solid var(--line)', paddingTop: 12, marginBottom: 10 }}>
                 <button
@@ -3203,7 +3522,7 @@ function StudioComments() {
                         <span style={{ fontWeight: 700, fontSize: 12, color: 'var(--link)' }}>{c.nickname}</span>
                         <span style={{ fontSize: 10, color: 'var(--ink-soft)' }}>{fmtRelative(c.ts)}</span>
                       </div>
-                      <div style={{ fontSize: 12.5, color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{c.text}</div>
+                      <div style={{ fontSize: 12.5, color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderRichText(c.text)}</div>
                     </div>
                   </div>
                 ))
@@ -3234,6 +3553,11 @@ function StudioComments() {
                     </div>
                   ))
                 )}
+                {projectChatTypingUsers.length > 0 && (
+                  <div style={{ fontSize: 11, color: 'var(--ink-soft)', fontStyle: 'italic', marginTop: 2 }}>
+                    {projectChatTypingUsers.map((t) => t.nickname).join('、')}さんが入力中…
+                  </div>
+                )}
                 <div ref={projectChatEndRef} />
               </>
               )}
@@ -3261,7 +3585,15 @@ function StudioComments() {
                   placeholder="チャットにメッセージを送る"
                   maxLength={COMMENT_MAX_LEN}
                   value={projectChatDraft}
-                  onChange={(e) => setProjectChatDraft(e.target.value)}
+                  onChange={(e) => {
+                    setProjectChatDraft(e.target.value);
+                    if (!activeProject) return;
+                    const now = Date.now();
+                    if (now - lastProjectTypingSentRef.current > 1500) {
+                      lastProjectTypingSentRef.current = now;
+                      sendTypingBeat('project:' + activeProject.id, userId, nickname);
+                    }
+                  }}
                   onKeyDown={(e) => { if (e.key === 'Enter') sendProjectChatMessage(); }}
                 />
                 <button className="sc-btn-primary sc-post-btn" disabled={!projectChatDraft.trim() || projectChatSending} onClick={sendProjectChatMessage}>
@@ -3278,6 +3610,11 @@ function StudioComments() {
           <div style={{ display: 'flex', flex: 1 }}>
             <button className={`sc-tab-btn ${view === 'lobby' ? 'active' : ''}`} onClick={() => switchTab('lobby')} style={{ position: 'relative', ...(tabBarCompact ? { padding: '6px 0' } : {}) }}>
               <Home size={tabBarCompact ? 16 : 18} />{!tabBarCompact && <span style={{ fontSize: 9.5, fontWeight: 700 }}>スタジオ</span>}
+              {roomsUnreadCount > 0 && (
+                <span style={{ position: 'absolute', top: 2, right: '28%', minWidth: 14, height: 14, padding: '0 3px', borderRadius: 7, background: 'var(--danger)', color: '#fff', fontSize: 9, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {roomsUnreadCount > 9 ? '9+' : roomsUnreadCount}
+                </span>
+              )}
             </button>
             <button className={`sc-tab-btn ${view === 'dm-list' ? 'active' : ''}`} onClick={() => switchTab('dm-list')} style={{ position: 'relative', ...(tabBarCompact ? { padding: '6px 0' } : {}) }}>
               <MessageCircle size={tabBarCompact ? 16 : 18} />{!tabBarCompact && <span style={{ fontSize: 9.5, fontWeight: 700 }}>DM</span>}
@@ -3388,9 +3725,30 @@ function StudioComments() {
                 <KeyRound size={11} /> チャット管理者
               </div>
               {siteAdminUnlocked ? (
-                <div style={{ fontSize: 11.5, color: 'var(--owner)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <ShieldCheck size={13} /> チャット管理者として有効になっています
-                </div>
+                <>
+                  <div style={{ fontSize: 11.5, color: 'var(--owner)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4, marginBottom: 8 }}>
+                    <ShieldCheck size={13} /> チャット管理者として有効になっています
+                  </div>
+                  <div style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--ink-soft)', marginBottom: 4 }}>全体へのお知らせ</div>
+                  <textarea
+                    className="sc-input rounded-lg px-3 py-2 text-sm"
+                    style={{ width: '100%', boxSizing: 'border-box', minHeight: 54, resize: 'vertical' }}
+                    placeholder="全ユーザーに表示するお知らせ"
+                    maxLength={300}
+                    value={announcementDraft}
+                    onChange={(e) => setAnnouncementDraft(e.target.value)}
+                  />
+                  <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                    <button className="sc-action-link" style={{ border: '1px solid var(--owner)', color: 'var(--owner)', borderRadius: 5, flex: 1, justifyContent: 'center', padding: '5px 0' }} onClick={postAnnouncement} disabled={!announcementDraft.trim()}>
+                      お知らせを出す
+                    </button>
+                    {announcement && (
+                      <button className="sc-action-link" style={{ border: '1px solid var(--line)', borderRadius: 5, flexShrink: 0, padding: '5px 10px' }} onClick={clearAnnouncement}>
+                        取り下げる
+                      </button>
+                    )}
+                  </div>
+                </>
               ) : (
                 <>
                   <div style={{ display: 'flex', gap: 6 }}>
